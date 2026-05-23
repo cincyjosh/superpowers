@@ -75,20 +75,24 @@ if [[ "$FOREGROUND" != "true" && "$FORCE_BACKGROUND" != "true" ]]; then
 fi
 
 # Generate unique session directory
-SESSION_ID="$$-$(date +%s)"
-
 if [[ -n "$PROJECT_DIR" ]]; then
+  SESSION_ID="$$-$(date +%s)"
   SESSION_DIR="${PROJECT_DIR}/.superpowers/brainstorm/${SESSION_ID}"
+  mkdir -p "${SESSION_DIR}/content"
+  chmod 700 "$SESSION_DIR" "${SESSION_DIR}/content"
 else
-  SESSION_DIR="/tmp/brainstorm-${SESSION_ID}"
+  # mktemp -d creates a randomly-named directory with secure 0700 permissions,
+  # preventing pre-creation attacks from other local users.
+  SESSION_DIR=$(mktemp -d "${TMPDIR:-/tmp}/brainstorm.XXXXXXXXXX")
+  mkdir -p "${SESSION_DIR}/content"
 fi
 
 STATE_DIR="${SESSION_DIR}/state"
 PID_FILE="${STATE_DIR}/server.pid"
 LOG_FILE="${STATE_DIR}/server.log"
 
-# Create fresh session directory with content and state peers
-mkdir -p "${SESSION_DIR}/content" "$STATE_DIR"
+mkdir -p "$STATE_DIR"
+chmod 700 "$STATE_DIR"
 
 # Kill any existing server
 if [[ -f "$PID_FILE" ]]; then

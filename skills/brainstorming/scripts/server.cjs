@@ -80,6 +80,7 @@ const SESSION_DIR = process.env.BRAINSTORM_DIR || '/tmp/brainstorm';
 const CONTENT_DIR = path.join(SESSION_DIR, 'content');
 const STATE_DIR = path.join(SESSION_DIR, 'state');
 let ownerPid = process.env.BRAINSTORM_OWNER_PID ? Number(process.env.BRAINSTORM_OWNER_PID) : null;
+const TOKEN = crypto.randomBytes(16).toString('hex');
 
 const MIME_TYPES = {
   '.html': 'text/html', '.css': 'text/css', '.js': 'application/javascript',
@@ -100,9 +101,31 @@ h1 { color: #333; } p { color: #666; }</style>
 
 const frameTemplate = fs.readFileSync(path.join(__dirname, 'frame-template.html'), 'utf-8');
 const helperScript = fs.readFileSync(path.join(__dirname, 'helper.js'), 'utf-8');
+const referrerMetaTag = '<meta name="referrer" content="same-origin">';
 const helperInjection = '<script>\n' + helperScript + '\n</script>';
 
 // ========== Helper Functions ==========
+
+function isAllowedOrigin(origin) {
+  if (!origin) return true;
+  try {
+    const { hostname } = new URL(origin);
+    return hostname === 'localhost' || hostname === '127.0.0.1' ||
+           hostname === '[::1]' || hostname === '::1' || hostname === URL_HOST;
+  } catch {
+    return false;
+  }
+}
+
+function isSameServerReferer(referer) {
+  if (!referer) return false;
+  try {
+    const u = new URL(referer);
+    return isAllowedOrigin(u.origin) && u.port === String(PORT);
+  } catch {
+    return false;
+  }
+}
 
 function isFullDocument(html) {
   const trimmed = html.trimStart().toLowerCase();
@@ -110,7 +133,7 @@ function isFullDocument(html) {
 }
 
 function wrapInFrame(content) {
-  return frameTemplate.replace('<!-- CONTENT -->', content);
+  return frameTemplate.replace('<!-- CONTENT -->', () => content);
 }
 
 function getNewestScreen() {
@@ -128,22 +151,44 @@ function getNewestScreen() {
 
 function handleRequest(req, res) {
   touchActivity();
-  if (req.method === 'GET' && req.url === '/') {
+  const urlObj = new URL(req.url, 'http://localhost');
+  if (req.method === 'GET' && urlObj.pathname === '/') {
+    if (urlObj.searchParams.get('token') !== TOKEN) {
+      res.writeHead(401, { 'Content-Type': 'text/plain' });
+      res.end('Unauthorized');
+      return;
+    }
+
     const screenFile = getNewestScreen();
     let html = screenFile
       ? (raw => isFullDocument(raw) ? raw : wrapInFrame(raw))(fs.readFileSync(screenFile, 'utf-8'))
       : WAITING_PAGE;
 
+    // Inject same-origin referrer policy. Placing it before </head> means it
+    // is parsed last and wins over any earlier conflicting meta in the document
+    // (browsers apply the most-recently-seen referrer policy meta).
+    if (/<\/head>/i.test(html)) {
+      html = html.replace(/<\/head>/i, () => referrerMetaTag + '\n</head>');
+    } else if (/<head\b/i.test(html)) {
+      html = html.replace(/(<head\b[^>]*>)/i, (m) => m + '\n' + referrerMetaTag);
+    } else {
+      html = referrerMetaTag + '\n' + html;
+    }
     if (html.includes('</body>')) {
-      html = html.replace('</body>', helperInjection + '\n</body>');
+      html = html.replace('</body>', () => helperInjection + '\n</body>');
     } else {
       html += helperInjection;
     }
 
     res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
     res.end(html);
-  } else if (req.method === 'GET' && req.url.startsWith('/files/')) {
-    const fileName = req.url.slice(7);
+  } else if (req.method === 'GET' && urlObj.pathname.startsWith('/files/')) {
+    if (urlObj.searchParams.get('token') !== TOKEN && !isSameServerReferer(req.headers['referer'])) {
+      res.writeHead(401, { 'Content-Type': 'text/plain' });
+      res.end('Unauthorized');
+      return;
+    }
+    const fileName = urlObj.pathname.slice(7);
     const filePath = path.join(CONTENT_DIR, path.basename(fileName));
     if (!fs.existsSync(filePath)) {
       res.writeHead(404);
@@ -165,6 +210,21 @@ function handleRequest(req, res) {
 const clients = new Set();
 
 function handleUpgrade(req, socket) {
+  // Reject cross-origin WebSocket connections (CSWSH defense)
+  if (!isAllowedOrigin(req.headers['origin'])) {
+    socket.write('HTTP/1.1 403 Forbidden\r\n\r\n');
+    socket.destroy();
+    return;
+  }
+
+  // Validate session token
+  const urlObj = new URL(req.url, 'http://localhost');
+  if (urlObj.searchParams.get('token') !== TOKEN) {
+    socket.write('HTTP/1.1 401 Unauthorized\r\n\r\n');
+    socket.destroy();
+    return;
+  }
+
   const key = req.headers['sec-websocket-key'];
   if (!key) { socket.destroy(); return; }
 
@@ -260,8 +320,8 @@ const debounceTimers = new Map();
 // ========== Server Startup ==========
 
 function startServer() {
-  if (!fs.existsSync(CONTENT_DIR)) fs.mkdirSync(CONTENT_DIR, { recursive: true });
-  if (!fs.existsSync(STATE_DIR)) fs.mkdirSync(STATE_DIR, { recursive: true });
+  if (!fs.existsSync(CONTENT_DIR)) fs.mkdirSync(CONTENT_DIR, { recursive: true, mode: 0o700 });
+  if (!fs.existsSync(STATE_DIR)) fs.mkdirSync(STATE_DIR, { recursive: true, mode: 0o700 });
 
   // Track known files to distinguish new screens from updates.
   // macOS fs.watch reports 'rename' for both new files and overwrites,
@@ -339,7 +399,7 @@ function startServer() {
   server.listen(PORT, HOST, () => {
     const info = JSON.stringify({
       type: 'server-started', port: Number(PORT), host: HOST,
-      url_host: URL_HOST, url: 'http://' + URL_HOST + ':' + PORT,
+      url_host: URL_HOST, url: 'http://' + URL_HOST + ':' + PORT + '/?token=' + TOKEN,
       screen_dir: CONTENT_DIR, state_dir: STATE_DIR
     });
     console.log(info);
