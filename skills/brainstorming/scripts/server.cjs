@@ -2,6 +2,7 @@ const crypto = require('crypto');
 const http = require('http');
 const fs = require('fs');
 const path = require('path');
+const os = require('os');
 
 // ========== WebSocket Protocol (RFC 6455) ==========
 
@@ -76,11 +77,24 @@ function decodeFrame(buffer) {
 const PORT = process.env.BRAINSTORM_PORT || (49152 + Math.floor(Math.random() * 16383));
 const HOST = process.env.BRAINSTORM_HOST || '127.0.0.1';
 const URL_HOST = process.env.BRAINSTORM_URL_HOST || (HOST === '127.0.0.1' ? 'localhost' : HOST);
-const SESSION_DIR = process.env.BRAINSTORM_DIR || '/tmp/brainstorm';
+
+// Default to a per-user directory in /tmp to prevent symlink/pre-creation attacks
+const DEFAULT_SESSION_DIR = path.join(os.tmpdir(), `brainstorm-${os.userInfo().username || 'user'}`);
+const SESSION_DIR = process.env.BRAINSTORM_DIR || DEFAULT_SESSION_DIR;
+
 const CONTENT_DIR = path.join(SESSION_DIR, 'content');
 const STATE_DIR = path.join(SESSION_DIR, 'state');
 let ownerPid = process.env.BRAINSTORM_OWNER_PID ? Number(process.env.BRAINSTORM_OWNER_PID) : null;
 const TOKEN = crypto.randomBytes(16).toString('hex');
+
+const COOKIE_NAME = 'bs-token';
+const MAX_WS_BUFFER = 1 * 1024 * 1024; // 1 MB per connection
+
+const SECURITY_HEADERS = {
+  'Content-Security-Policy': "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; connect-src 'self' ws://localhost:* ws://127.0.0.1:*; img-src 'self' data: https:; object-src 'none'",
+  'X-Content-Type-Options': 'nosniff',
+  'X-Frame-Options': 'SAMEORIGIN',
+};
 
 const MIME_TYPES = {
   '.html': 'text/html', '.css': 'text/css', '.js': 'application/javascript',
@@ -117,19 +131,36 @@ function isAllowedOrigin(origin) {
   }
 }
 
-function isSameServerReferer(referer) {
-  if (!referer) return false;
-  try {
-    const u = new URL(referer);
-    return isAllowedOrigin(u.origin) && u.port === String(PORT);
-  } catch {
-    return false;
-  }
-}
-
 function isFullDocument(html) {
   const trimmed = html.trimStart().toLowerCase();
   return trimmed.startsWith('<!doctype') || trimmed.startsWith('<html');
+}
+
+function extractToken(req) {
+  const urlObj = new URL(req.url, 'http://localhost');
+  const queryToken = urlObj.searchParams.get('token');
+  if (queryToken) return queryToken;
+  const cookies = req.headers['cookie'] || '';
+  for (const part of cookies.split(';')) {
+    const eqIdx = part.indexOf('=');
+    if (eqIdx === -1) continue;
+    const k = part.slice(0, eqIdx).trim();
+    const v = part.slice(eqIdx + 1).trim();
+    if (k === COOKIE_NAME && v) return v;
+  }
+  return null;
+}
+
+function stripScriptTags(html) {
+  return html
+    // Strip <script> tags
+    .replace(/<script\b[^>]*>[\s\S]*?<\/script\s*>/gi, '')
+    // Strip inline event handlers (e.g., onclick, onload)
+    .replace(/\s+on[a-z]+\s*=\s*(['"])[^'"]*\1/gi, '')
+    .replace(/\s+on[a-z]+\s*=\s*[^\s>]+/gi, '')
+    // Strip javascript: URLs
+    .replace(/href\s*=\s*(['"])javascript:[^'"]*\1/gi, 'href="#"')
+    .replace(/src\s*=\s*(['"])javascript:[^'"]*\1/gi, 'src=""');
 }
 
 function wrapInFrame(content) {
@@ -153,7 +184,7 @@ function handleRequest(req, res) {
   touchActivity();
   const urlObj = new URL(req.url, 'http://localhost');
   if (req.method === 'GET' && urlObj.pathname === '/') {
-    if (urlObj.searchParams.get('token') !== TOKEN) {
+    if (extractToken(req) !== TOKEN) {
       res.writeHead(401, { 'Content-Type': 'text/plain' });
       res.end('Unauthorized');
       return;
@@ -161,7 +192,7 @@ function handleRequest(req, res) {
 
     const screenFile = getNewestScreen();
     let html = screenFile
-      ? (raw => isFullDocument(raw) ? raw : wrapInFrame(raw))(fs.readFileSync(screenFile, 'utf-8'))
+      ? (raw => isFullDocument(raw) ? raw : wrapInFrame(stripScriptTags(raw)))(fs.readFileSync(screenFile, 'utf-8'))
       : WAITING_PAGE;
 
     // Inject same-origin referrer policy. Placing it before </head> means it
@@ -180,10 +211,14 @@ function handleRequest(req, res) {
       html += helperInjection;
     }
 
-    res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
+    res.writeHead(200, {
+      'Content-Type': 'text/html; charset=utf-8',
+      'Set-Cookie': `${COOKIE_NAME}=${TOKEN}; HttpOnly; SameSite=Strict; Path=/`,
+      ...SECURITY_HEADERS,
+    });
     res.end(html);
   } else if (req.method === 'GET' && urlObj.pathname.startsWith('/files/')) {
-    if (urlObj.searchParams.get('token') !== TOKEN && !isSameServerReferer(req.headers['referer'])) {
+    if (extractToken(req) !== TOKEN) {
       res.writeHead(401, { 'Content-Type': 'text/plain' });
       res.end('Unauthorized');
       return;
@@ -217,9 +252,8 @@ function handleUpgrade(req, socket) {
     return;
   }
 
-  // Validate session token
-  const urlObj = new URL(req.url, 'http://localhost');
-  if (urlObj.searchParams.get('token') !== TOKEN) {
+  // Validate session token (query param or cookie)
+  if (extractToken(req) !== TOKEN) {
     socket.write('HTTP/1.1 401 Unauthorized\r\n\r\n');
     socket.destroy();
     return;
@@ -240,6 +274,13 @@ function handleUpgrade(req, socket) {
   clients.add(socket);
 
   socket.on('data', (chunk) => {
+    if (buffer.length + chunk.length > MAX_WS_BUFFER) {
+      const closeBuf = Buffer.alloc(2);
+      closeBuf.writeUInt16BE(1009); // Message Too Big
+      socket.end(encodeFrame(OPCODES.CLOSE, closeBuf));
+      clients.delete(socket);
+      return;
+    }
     buffer = Buffer.concat([buffer, chunk]);
     while (buffer.length > 0) {
       let result;
@@ -317,11 +358,37 @@ function touchActivity() {
 
 const debounceTimers = new Map();
 
+function ensureSecureDir(dirPath) {
+  if (fs.existsSync(dirPath)) {
+    const stats = fs.lstatSync(dirPath);
+    if (stats.isSymbolicLink()) {
+      throw new Error(`Security error: ${dirPath} is a symbolic link`);
+    }
+    if (!stats.isDirectory()) {
+      throw new Error(`Security error: ${dirPath} is not a directory`);
+    }
+    // Check permissions (should be 0700)
+    const mode = stats.mode & 0o777;
+    if (mode !== 0o700) {
+      console.warn(`Warning: ${dirPath} has insecure permissions: ${mode.toString(8)}. Attempting to fix...`);
+      fs.chmodSync(dirPath, 0o700);
+    }
+  } else {
+    fs.mkdirSync(dirPath, { recursive: true, mode: 0o700 });
+  }
+}
+
 // ========== Server Startup ==========
 
 function startServer() {
-  if (!fs.existsSync(CONTENT_DIR)) fs.mkdirSync(CONTENT_DIR, { recursive: true, mode: 0o700 });
-  if (!fs.existsSync(STATE_DIR)) fs.mkdirSync(STATE_DIR, { recursive: true, mode: 0o700 });
+  try {
+    ensureSecureDir(SESSION_DIR);
+    ensureSecureDir(CONTENT_DIR);
+    ensureSecureDir(STATE_DIR);
+  } catch (err) {
+    console.error(`Failed to initialize secure session directory: ${err.message}`);
+    process.exit(1);
+  }
 
   // Track known files to distinguish new screens from updates.
   // macOS fs.watch reports 'rename' for both new files and overwrites,

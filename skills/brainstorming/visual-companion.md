@@ -89,6 +89,8 @@ scripts/start-server.sh \
   --url-host localhost
 ```
 
+**Security note:** `--host 0.0.0.0` exposes the server on all network interfaces, making it reachable by any machine on the local network. Only use this in isolated/trusted environments (VMs, containers with no external network exposure). Prefer a specific interface IP over `0.0.0.0` where possible.
+
 Use `--url-host` to control what hostname is printed in the returned URL JSON.
 
 ## The Loop

@@ -1,5 +1,5 @@
 (function() {
-  const WS_URL = 'ws://' + window.location.host + '/' + window.location.search;
+  const WS_URL = 'ws://' + window.location.host + '/';
   let ws = null;
   let eventQueue = [];
 
