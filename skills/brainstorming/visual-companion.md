@@ -73,9 +73,9 @@ scripts/start-server.sh --project-dir /path/to/project
 
 **Gemini CLI:**
 ```bash
-# Use --foreground and set is_background: true on your shell tool call
-# so the process survives across turns
-scripts/start-server.sh --project-dir /path/to/project --foreground
+# Gemini CLI sets GEMINI_CLI=1, so the script auto-selects foreground mode.
+# Put the command in the shell background so Gemini tracks it as a background process.
+scripts/start-server.sh --project-dir /path/to/project &
 ```
 
 **Other environments:** The server must keep running in the background across conversation turns. If your environment reaps detached processes, use `--foreground` and launch the command with your platform's background execution mechanism.
